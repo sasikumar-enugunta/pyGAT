@@ -17,11 +17,15 @@ class GraphAttentionLayer(nn.Module):
         self.alpha = alpha
 
         self.W = nn.Parameter(torch.empty(size=(self.in_features, self.out_features)))
-        nn.init.normal_(self.W.data, mean=0, std=0.1)
-        self.a = nn.Parameter(torch.empty(size=(self.in_features + 5, 1)))
-        nn.init.normal_(self.a.data, mean=0, std=0.1)
+        # Better initialization: Xavier uniform for better gradient flow
+        nn.init.xavier_uniform_(self.W.data, gain=1.414)
+        # Attention parameter: [ti, rij, tj] where ti and tj are out_features, rij is 5
+        # So total dimension is 2 * out_features + 5
+        self.a = nn.Parameter(torch.empty(size=(2 * self.out_features + 5, 1)))
+        nn.init.xavier_uniform_(self.a.data, gain=1.414)
 
         self.leakyrelu = nn.LeakyReLU(self.alpha)
+        self.dropout_layer = nn.Dropout(dropout)
 
     def forward(self, ids, lstm_out, edges_list, adj_mat, first):
         final_lstm_dict = {}
@@ -41,6 +45,17 @@ class GraphAttentionLayer(nn.Module):
 
     def _construct_node_edge_embeddings(self, wh, rij):
         n = wh.size()[0]
+        expected_rij_size = n * n
+        if rij.size()[0] != expected_rij_size:
+            # Reshape or pad rij to match expected size
+            if rij.size()[0] < expected_rij_size:
+                # Pad with zeros
+                padding_size = expected_rij_size - rij.size()[0]
+                padding = torch.zeros(padding_size, rij.size()[1], dtype=rij.dtype, device=rij.device)
+                rij = torch.cat([rij, padding], dim=0)
+            else:
+                # Truncate to expected size
+                rij = rij[:expected_rij_size]
         ti = wh.repeat_interleave(n, dim=0)
         tj = wh.repeat(n, 1)
         hij = torch.cat([ti, rij, tj], dim=1)
@@ -55,8 +70,13 @@ class GraphAttentionLayer(nn.Module):
         adj = torch.from_numpy(a)
         attention = torch.where(adj_mat > 0, node_edge_embeddings, zero_vec)
         attention = F.softmax(attention, dim=1)
-        attention = F.dropout(attention, self.dropout, training=self.training)
+        attention = self.dropout_layer(attention)
         h_prime = torch.mm(attention, wh)
+        
+        # Add residual connection if dimensions match
+        if h_prime.size() == wh.size():
+            h_prime = h_prime + wh  # Residual connection
+        
         return h_prime
 
     def __repr__(self):

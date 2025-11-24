@@ -1,0 +1,11 @@
+torch>=1.0.0
+torchvision>=0.2.0
+numpy>=1.16.0
+pandas>=0.24.0
+scikit-learn>=0.20.0
+opencv-python>=4.0.0
+Pillow>=6.0.0
+easyocr>=1.0.0
+webcolors>=1.9.0
+extcolors>=1.0.0
+

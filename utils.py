@@ -2,6 +2,7 @@ import torch
 import pandas as pd
 import numpy as np
 import io
+import os
 import torch.nn as nn
 
 
@@ -128,11 +129,54 @@ def read_file(ner_file):
 
 def get_edges_list_with_ids(ids, edge_embeddings):
     ids_int = [int(i) for i in ids]
+    num_nodes = len(ids_int)
+    
+    if edge_embeddings.empty or 'src' not in edge_embeddings.columns:
+        # Return edge list with shape (num_nodes * num_nodes, 5) for all node pairs
+        # Each row represents edge features for one (src, dst) pair
+        edges_list = torch.zeros(num_nodes * num_nodes, 5, dtype=torch.float32)
+        return ids_int, edges_list
+    
     df1 = edge_embeddings.loc[edge_embeddings['src'].isin(ids_int)]
-    new_df = df1[['src', 'hori_dist', 'vert_dist', 'ar_one', 'ar_two', 'ar_three', 'dest']]
-    numpy_df = new_df.to_numpy()
-    numpy_edges = numpy_df[:, 1:6]
-    edges_list = torch.FloatTensor(numpy_edges)
+    if df1.empty:
+        # No matching edges found, return zeros with correct shape
+        edges_list = torch.zeros(num_nodes * num_nodes, 5, dtype=torch.float32)
+        return ids_int, edges_list
+    
+    # Create a mapping from src_id to edge features
+    edge_dict = {}
+    for _, row in df1.iterrows():
+        src_id = row['src']
+        if src_id not in edge_dict:
+            edge_dict[src_id] = row[['hori_dist', 'vert_dist', 'ar_one', 'ar_two', 'ar_three']].values.astype(np.float32)
+    
+    # Create edge features for all node pairs (n*n pairs)
+    # Structure: for each source node i, we create n edges (i->0, i->1, ..., i->n-1)
+    edges_list = []
+    for src_idx in range(num_nodes):
+        src_id = ids_int[src_idx]
+        if src_id in edge_dict:
+            edge_feat = edge_dict[src_id].copy()
+        else:
+            edge_feat = np.zeros(5, dtype=np.float32)
+        # Repeat for all destination nodes (creates n pairs for this source)
+        for dst_idx in range(num_nodes):
+            edges_list.append(edge_feat)
+    
+    edges_array = np.array(edges_list, dtype=np.float32)
+    # Ensure we have exactly n*n rows
+    expected_rows = num_nodes * num_nodes
+    if len(edges_array) != expected_rows:
+        # This shouldn't happen, but handle it
+        if len(edges_array) < expected_rows:
+            # Pad with zeros
+            padding = np.zeros((expected_rows - len(edges_array), 5), dtype=np.float32)
+            edges_array = np.vstack([edges_array, padding])
+        else:
+            # Truncate
+            edges_array = edges_array[:expected_rows]
+    
+    edges_list = torch.FloatTensor(edges_array)
     return ids_int, edges_list
 
 
@@ -230,22 +274,45 @@ def read_word(f):
     return s.strip(' \n')
 
 
-def generate_w2v(vocab, path='./data/invoice/'):
+def generate_w2v(vocab, path='./data/invoice/', embed_dim=300):
     pretrained_embed_file = 'GoogleNews-vectors-negative300.bin'
     vocab_size = len(vocab)
-    with io.open(path + pretrained_embed_file, "rb") as f:
-        header = f.readline()
-        file_vocab_size, embed_dim = map(int, header.split())
-        weight = init_embeddings(vocab_size, embed_dim)
+    weight = init_embeddings(vocab_size, embed_dim)
+    
+    # Try to load pre-trained embeddings
+    file_path = path + pretrained_embed_file
+    if os.path.exists(file_path):
+        print(f'Loading pre-trained Word2Vec embeddings from {pretrained_embed_file}...')
+        try:
+            with io.open(file_path, "rb") as f:
+                header = f.readline()
+                file_vocab_size, file_embed_dim = map(int, header.split())
+                if file_embed_dim != embed_dim:
+                    print(f'Warning: File embed_dim ({file_embed_dim}) != requested ({embed_dim}). Using file dimension.')
+                    embed_dim = file_embed_dim
+                    weight = init_embeddings(vocab_size, embed_dim)
+                
+                if '[PAD]' in vocab:
+                    weight[vocab['[PAD]']] = 0.0
+                width = 4 * embed_dim
+                loaded_count = 0
+                for i in range(file_vocab_size):
+                    word = read_word(f)
+                    raw = f.read(width)
+                    if word in vocab:
+                        vec = np.fromstring(raw, dtype=np.float32)
+                        weight[vocab[word]] = vec
+                        loaded_count += 1
+                print(f'Loaded {loaded_count} pre-trained embeddings out of {vocab_size} vocabulary words.')
+        except Exception as e:
+            print(f'Warning: Could not load pre-trained embeddings: {e}')
+            print('Using randomly initialized embeddings instead.')
+    else:
+        print(f'Warning: Pre-trained Word2Vec file not found at {file_path}')
+        print('Using randomly initialized embeddings. For better performance, download GoogleNews-vectors-negative300.bin')
         if '[PAD]' in vocab:
             weight[vocab['[PAD]']] = 0.0
-        width = 4 * embed_dim
-        for i in range(file_vocab_size):
-            word = read_word(f)
-            raw = f.read(width)
-            if word in vocab:
-                vec = np.fromstring(raw, dtype=np.float32)
-                weight[vocab[word]] = vec
+    
     embeddings = nn.Embedding(weight.shape[0], weight.shape[1])
     embeddings.weight = nn.Parameter(torch.from_numpy(weight).float())
     return embeddings, embed_dim
@@ -261,7 +328,13 @@ def load_data(path="./data/invoice/", dataset="invoice"):
 
 
 def load_edge_embed_data(path="./data/invoice/", dataset="invoice"):
-    edge_file = open("{}{}.final_edge_embeddings_updated".format(path, dataset), encoding="utf-8")
+    edge_file_path = "{}{}.final_edge_embeddings_updated".format(path, dataset)
+    if not os.path.exists(edge_file_path):
+        print(f'Warning: Edge embeddings file not found at {edge_file_path}')
+        print('Creating empty edge embeddings dataframe. The model may not work correctly without edge data.')
+        # Return empty dataframe with expected columns
+        return pd.DataFrame(columns=['src', 'hori_dist', 'vert_dist', 'ar_one', 'ar_two', 'ar_three', 'dest'])
+    edge_file = open(edge_file_path, encoding="utf-8")
     df = pd.read_csv(edge_file)
     return df
 
